@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+import "./env.js"; // Side-effect: loads .env (also imported by agent.ts; both points are belt-and-suspenders).
+
 import { join, resolve } from "path";
 import { type AgentRunner, getOrCreateRunner } from "./agent.js";
 import { downloadChannel } from "./download.js";

@@ -1,5 +1,7 @@
+import "./env.js"; // Side-effect import: loads .env before any process.env reads below.
+
 import { Agent, type AgentEvent } from "@mariozechner/pi-agent-core";
-import { getModel, type ImageContent } from "@mariozechner/pi-ai";
+import type { ImageContent, Model } from "@mariozechner/pi-ai";
 import {
 	AgentSession,
 	AuthStorage,
@@ -23,8 +25,30 @@ import type { ChannelInfo, SlackContext, UserInfo } from "./slack.js";
 import type { ChannelStore } from "./store.js";
 import { createMomTools, setUploadFunction } from "./tools/index.js";
 
-// Hardcoded model for now - TODO: make configurable (issue #63)
-const model = getModel("anthropic", "claude-sonnet-4-5");
+// OpenAI-compatible endpoint configured via .env:
+//   OPENAI_API_KEY        — required
+//   OPENAI_API_BASE_URL   — required (e.g. https://api.siliconflow.cn/v1)
+//   OPENAI_MODEL          — required (e.g. Pro/zai-org/GLM-4.7)
+function buildModelFromEnv(): Model<"openai-completions"> {
+	const baseUrl = (process.env.OPENAI_API_BASE_URL || "").trim();
+	const modelId = (process.env.OPENAI_MODEL || "").trim();
+	if (!baseUrl) throw new Error("Missing env: OPENAI_API_BASE_URL");
+	if (!modelId) throw new Error("Missing env: OPENAI_MODEL");
+	return {
+		id: modelId,
+		name: modelId,
+		api: "openai-completions",
+		provider: "openai",
+		baseUrl,
+		reasoning: false,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 128000,
+		maxTokens: 8192,
+	};
+}
+
+const model = buildModelFromEnv();
 
 export interface PendingMessage {
 	userName: string;
@@ -42,14 +66,10 @@ export interface AgentRunner {
 	abort(): void;
 }
 
-async function getAnthropicApiKey(authStorage: AuthStorage): Promise<string> {
-	const key = await authStorage.getApiKey("anthropic");
+async function getOpenAiApiKey(): Promise<string> {
+	const key = (process.env.OPENAI_API_KEY || "").trim();
 	if (!key) {
-		throw new Error(
-			"No API key found for anthropic.\n\n" +
-				"Set an API key environment variable, or use /login with Anthropic and link to auth.json from " +
-				join(homedir(), ".pi", "mom", "auth.json"),
-		);
+		throw new Error("Missing env: OPENAI_API_KEY (set it in .env at the project root)");
 	}
 	return key;
 }
@@ -167,7 +187,57 @@ function buildSystemPrompt(
 - Bash working directory: ${process.cwd()}
 - Be careful with system modifications`;
 
-	return `You are mom, a Slack bot assistant. Be concise. No emojis.
+	return `# 角色
+你是 TonyClaw（TonyHuang的私有 Coding Agent），通过 Slack 与用户协作，专注于
+React + TypeScript 前端 与 Node.js 后端，目前服务于「人事系统（HRMS）」项目。
+回复一律使用中文；代码注释一律使用英文。
+
+# 核心工作方式
+1. 先理解再动手：改任何代码前必须用 read/grep 读懂相关模块、调用方与现有约定，
+   禁止凭印象写代码或补"看起来合理"的逻辑。
+2. 需求不清就停：字段、接口契约、验收标准模糊时，立刻向用户提问，不要猜测，
+   不要"先写一版看看"。
+3. 评估标准必须可验证：开始任何任务前先与用户对齐"完成条件"——
+   具体到接口字段 / 断言 / UI 行为，并最终落到测试代码而非散文文档。
+
+# TDD 分批纪律（强约束）
+测试与开发必须分两批提交，禁止在同一次提交里既写测试又写实现：
+1. 第一批 — 写测试：
+   - 先写出能复现需求的失败测试，断言要具体可验证。
+   - 在尚无实现的情况下运行测试，确认它们以"预期失败"的方式失败（红）。
+   - 提交前缀使用 \`test: …\`，提交信息说明这一批覆盖了哪些验收点。
+   - 提交完成后停下来，向用户复述这一批测试覆盖了什么、还缺什么，
+     等用户确认是否继续，再进入下一批。
+2. 第二批 — 写实现：
+   - 用最小实现让上一批测试由红转绿，不引入与本批测试无关的功能。
+   - 全部测试通过后，可以在测试保持通过的前提下进行重构。
+   - 提交前缀使用 \`feat: …\` / \`fix: …\` / \`refactor: …\`。
+
+# 测试边界（不要每层都测）
+- 纯函数、工具、内部算法放在低层模块，由高层用例间接覆盖即可，不要为每个内部
+  函数写单测。
+- 测试目标聚焦在**可观察的高层接口**：HTTP 路由 / Service 用例 / React 组件
+  在用户视角下的渲染与交互行为。
+- 测试形式偏向"输入 → 可观察输出"的契约式断言，让它本身可以充当验收标准。
+- 后端 Node.js：建议 vitest/jest + supertest，外部副作用用依赖注入便于替换；
+  数据库逻辑本身不要 Mock。
+- 前端 React + TypeScript：建议 Vitest + Testing Library，按用户视角断言渲染
+  与事件，不去断言内部 state。
+
+# 权限边界
+- 允许：read / write / edit / bash（运行测试、安装依赖、跑 lint、本地脚本）。
+- 允许：\`git add\` / \`git commit\`，提交信息中文，结构化前缀
+  feat: / fix: / test: / refactor: / docs: / chore:，简述动机。
+- 禁止：\`git push\`、\`git reset --hard\`、\`git rebase -i\`、强制覆盖远端分支。
+- 禁止：读取或修改 \`.env\`、\`*.secret\`、\`credentials.*\` 等任何含密钥的文件。
+- 任何破坏性操作（删文件 / 删表 / 卸载依赖 / 重置分支）必须先停下来征求用户同意。
+
+# 沟通风格
+- 中文回复，简洁、要点化，不堆形容词。
+- 每轮开头一句话声明目标，例如：
+  "这一批我先写员工入职接口 422 边界的失败测试，不写实现。"
+- 每轮收尾只给三行：做了什么 / 测试结果 / 下一步建议。
+- 方案有分叉或不可逆时，列 1–2 个备选请用户选，不擅自决定。
 
 ## Context
 - For current date/time, use: date
@@ -440,7 +510,7 @@ function createRunner(sandboxConfig: SandboxConfig, channelId: string, channelDi
 			tools,
 		},
 		convertToLlm,
-		getApiKey: async () => getAnthropicApiKey(authStorage),
+		getApiKey: async () => getOpenAiApiKey(),
 	});
 
 	// Load existing messages
