@@ -3,9 +3,17 @@ set -e
 
 CONTAINER_NAME="mom-sandbox"
 DATA_DIR="$(pwd)/data"
+HRSYSTEM_DIR="${HRSYSTEM_DIR:-/c/Users/tonyh/Desktop/hrsystem}"
 
 # Create data directory if it doesn't exist
 mkdir -p "$DATA_DIR"
+
+# Verify project dir exists (bind-mounted into the container so the agent can edit it)
+if [ ! -d "$HRSYSTEM_DIR" ]; then
+    echo "Error: HRSYSTEM_DIR not found: $HRSYSTEM_DIR"
+    echo "Override with: HRSYSTEM_DIR=/path/to/project ./dev.sh"
+    exit 1
+fi
 
 # Check if container exists
 if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
@@ -18,9 +26,10 @@ if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
     fi
 else
     echo "Creating container: $CONTAINER_NAME"
-    docker run -d \
+    MSYS_NO_PATHCONV=1 docker run -d \
         --name "$CONTAINER_NAME" \
         -v "$DATA_DIR:/workspace" \
+        -v "$HRSYSTEM_DIR:/workspace/hrsystem" \
         alpine:latest \
         tail -f /dev/null
 fi

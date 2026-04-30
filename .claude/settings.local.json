@@ -1,7 +1,20 @@
 {
   "permissions": {
     "allow": [
-      "Bash(npx tsgo *)"
+      "Bash(npx tsgo *)",
+      "Read(//c/Users/tonyh/Desktop/hrsystem/**)",
+      "Read(//c/Users/tonyh/**)",
+      "Bash(docker --version)",
+      "Bash(docker rm *)",
+      "Bash(./docker.sh create *)",
+      "Bash(docker exec *)",
+      "Bash(MSYS_NO_PATHCONV=1 docker exec mom-sandbox ls /workspace)",
+      "Bash(MSYS_NO_PATHCONV=1 docker exec mom-sandbox ls /workspace/hrsystem)",
+      "Bash(tasklist)",
+      "Bash(grep -oE \"Bash working directory: [^\\\\\\\\\\\\\\\\\\\\\"]+\" c:/Users/tonyh/Desktop/pi-mono/packages/mom/data/C0B13QTNAMP/last_prompt.jsonl)",
+      "Bash(grep -oE \"running \\(inside|directly\\)[^\\\\\\\\\\\\\\\\\\\\\"]+\" c:/Users/tonyh/Desktop/pi-mono/packages/mom/data/C0B13QTNAMP/last_prompt.jsonl)",
+      "Bash(cmd //c \"docker exec mom-sandbox sh -c 'ls /workspace/hrsystem'\")",
+      "Bash(echo \"---exit=$?---\")"
     ]
   }
 }

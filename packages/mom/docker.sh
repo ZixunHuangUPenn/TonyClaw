@@ -11,6 +11,7 @@
 
 CONTAINER_NAME="mom-sandbox"
 IMAGE="alpine:latest"
+HRSYSTEM_DIR="${HRSYSTEM_DIR:-/c/Users/tonyh/Desktop/hrsystem}"
 
 case "$1" in
   create)
@@ -21,18 +22,26 @@ case "$1" in
     fi
     
     DATA_DIR=$(cd "$2" && pwd)
-    
+
     if docker ps -a --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
       echo "Container '${CONTAINER_NAME}' already exists. Remove it first with: $0 remove"
       exit 1
     fi
-    
+
+    if [ ! -d "$HRSYSTEM_DIR" ]; then
+      echo "Error: HRSYSTEM_DIR not found: $HRSYSTEM_DIR"
+      echo "Override with: HRSYSTEM_DIR=/path/to/project $0 create $2"
+      exit 1
+    fi
+
     echo "Creating container '${CONTAINER_NAME}'..."
-    echo "  Data dir: ${DATA_DIR} -> /workspace"
-    
-    docker run -d \
+    echo "  Data dir:    ${DATA_DIR} -> /workspace"
+    echo "  Project dir: ${HRSYSTEM_DIR} -> /workspace/hrsystem"
+
+    MSYS_NO_PATHCONV=1 docker run -d \
       --name "$CONTAINER_NAME" \
       -v "${DATA_DIR}:/workspace" \
+      -v "${HRSYSTEM_DIR}:/workspace/hrsystem" \
       "$IMAGE" \
       tail -f /dev/null
     
