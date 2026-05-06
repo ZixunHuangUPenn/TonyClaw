@@ -7,8 +7,7 @@
 FROM node:20-bookworm-slim
 
 # docker CLI: mom shells out to `docker exec mom-sandbox ...` (sandbox.ts).
-# Installing docker.io brings the CLI; the daemon binary inside this image is
-# never started — we mount the host's docker.sock instead.
+# tzdata/ca-certs for HTTPS + correct timestamps in logs/events.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends docker.io ca-certificates tzdata \
  && rm -rf /var/lib/apt/lists/*
@@ -18,21 +17,22 @@ WORKDIR /app
 # --- Dependency layer ---
 # Copy lockfile + every workspace's package.json so `npm ci` resolves the
 # graph. Source changes below this line don't bust the install cache.
-COPY package.json package-lock.json ./
+COPY package.json package-lock.json tsconfig.base.json tsconfig.json ./
 COPY packages/ai/package.json           packages/ai/package.json
 COPY packages/agent/package.json        packages/agent/package.json
 COPY packages/coding-agent/package.json packages/coding-agent/package.json
 COPY packages/mom/package.json          packages/mom/package.json
 COPY packages/tui/package.json          packages/tui/package.json
 
-# --ignore-scripts skips native postinstalls (canvas etc. in dev deps we
-# don't need at runtime). tsgo/typescript are pure JS — they don't need it.
+# --ignore-scripts skips native postinstalls (canvas in pi-ai's devDeps).
+# Verified in CI: tsgo's binary is shipped inside its package, no postinstall
+# needed, so the build chain still works.
 RUN npm ci --ignore-scripts
 
 # --- Source + build layer ---
 COPY packages packages
 
-# Build only the chain mom transitively imports. Skip tui/web-ui/pods.
+# Build only the chain mom transitively imports. Skip tui.
 # pi-ai's build hits openrouter.ai / models.dev for model registry — needs net.
 RUN cd packages/ai           && npm run build \
  && cd ../agent              && npm run build \
