@@ -14,7 +14,15 @@
       "Bash(grep -oE \"Bash working directory: [^\\\\\\\\\\\\\\\\\\\\\"]+\" c:/Users/tonyh/Desktop/pi-mono/packages/mom/data/C0B13QTNAMP/last_prompt.jsonl)",
       "Bash(grep -oE \"running \\(inside|directly\\)[^\\\\\\\\\\\\\\\\\\\\\"]+\" c:/Users/tonyh/Desktop/pi-mono/packages/mom/data/C0B13QTNAMP/last_prompt.jsonl)",
       "Bash(cmd //c \"docker exec mom-sandbox sh -c 'ls /workspace/hrsystem'\")",
-      "Bash(echo \"---exit=$?---\")"
+      "Bash(echo \"---exit=$?---\")",
+      "Bash(rm -rf c:/Users/tonyh/Desktop/pi-mono/node_modules c:/Users/tonyh/Desktop/pi-mono/package-lock.json c:/Users/tonyh/Desktop/pi-mono/packages/*/node_modules c:/Users/tonyh/Desktop/pi-mono/packages/*/dist 2>&1 | tail -5; echo \"---cleaned---\"; ls c:/Users/tonyh/Desktop/pi-mono/packages/)",
+      "Bash(npm install *)",
+      "Bash(npm run *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)"
+    ],
+    "additionalDirectories": [
+      "c:\\Users\\tonyh\\Desktop\\pi-mono\\packages\\*"
     ]
   }
 }

@@ -1,0 +1,28 @@
+services:
+  mom-sandbox:
+    image: alpine:latest
+    container_name: mom-sandbox
+    command: tail -f /dev/null
+    restart: unless-stopped
+    volumes:
+      - /opt/mom/data:/workspace
+      # Mount host project repos here if you want the agent to work on them.
+      # Anything NOT mounted is invisible to the agent.
+      # - /opt/projects/hrsystem:/workspace/hrsystem
+
+  mom:
+    image: ghcr.io/zixunhuangupenn/pi-mono-mom:latest
+    container_name: mom
+    restart: unless-stopped
+    depends_on:
+      - mom-sandbox
+    env_file: ./.env
+    environment:
+      TZ: Asia/Shanghai
+    volumes:
+      # Same host dir mounted at a different path — see translatePath in agent.ts
+      - /opt/mom/data:/workspace/data
+      # docker.sock: lets mom `docker exec mom-sandbox ...`. This effectively
+      # gives the mom container root on the host. Acceptable because mom *is*
+      # the orchestrator; the LLM-controlled bash still runs inside sandbox.
+      - /var/run/docker.sock:/var/run/docker.sock
