@@ -24,8 +24,6 @@ COPY packages/agent/package.json        packages/agent/package.json
 COPY packages/coding-agent/package.json packages/coding-agent/package.json
 COPY packages/mom/package.json          packages/mom/package.json
 COPY packages/tui/package.json          packages/tui/package.json
-COPY packages/web-ui/package.json       packages/web-ui/package.json
-COPY packages/pods/package.json         packages/pods/package.json
 
 # --ignore-scripts skips native postinstalls (canvas etc. in dev deps we
 # don't need at runtime). tsgo/typescript are pure JS — they don't need it.
