@@ -32,9 +32,11 @@ RUN npm ci --ignore-scripts
 # --- Source + build layer ---
 COPY packages packages
 
-# Build only the chain mom transitively imports. Skip tui.
+# Build the chain mom transitively imports. Order matters:
+# pi-coding-agent imports type declarations from pi-tui, so tui must build first.
 # pi-ai's build hits openrouter.ai / models.dev for model registry — needs net.
-RUN cd packages/ai           && npm run build \
+RUN cd packages/tui          && npm run build \
+ && cd ../ai                 && npm run build \
  && cd ../agent              && npm run build \
  && cd ../coding-agent       && npm run build \
  && cd ../mom                && npm run build

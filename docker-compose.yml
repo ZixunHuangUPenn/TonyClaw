@@ -6,9 +6,12 @@ services:
     restart: unless-stopped
     volumes:
       - /opt/mom/data:/workspace
-      # Mount host project repos here if you want the agent to work on them.
-      # Anything NOT mounted is invisible to the agent.
-      # - /opt/projects/hrsystem:/workspace/hrsystem
+      # Project repo the agent is allowed to read/edit/commit on.
+      # Clone on host first: git clone <url> /opt/projects/hrsystem
+      - /opt/projects/hrsystem:/workspace/hrsystem
+      # Per-repo SSH deploy key + git identity so the agent can `git push`.
+      # See "推送权限" section in the deploy notes for setup.
+      - /opt/mom/sandbox-ssh:/root/.ssh:ro
 
   mom:
     image: ghcr.io/zixunhuangupenn/pi-mono-mom:latest
