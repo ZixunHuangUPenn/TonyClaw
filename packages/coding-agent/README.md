@@ -633,3 +633,256 @@ MIT
 - [@mariozechner/pi-ai](https://www.npmjs.com/package/@mariozechner/pi-ai): Core LLM toolkit
 - [@mariozechner/pi-agent](https://www.npmjs.com/package/@mariozechner/pi-agent): Agent framework
 - [@mariozechner/pi-tui](https://www.npmjs.com/package/@mariozechner/pi-tui): Terminal UI components
+
+---
+
+## Architecture Notes (pi-mono)
+
+A reading of `packages/agent`, `packages/coding-agent`, and `packages/mom` summarized along four axes: context management, tool use, subagents, and failure handling. Followed by a deep dive into compaction (trigger and pipeline).
+
+### 1. Context / State / Memory
+
+State, context, and memory are kept in three separate layers.
+
+#### a) State — in-memory only
+
+`packages/agent/src/agent.ts` (`Agent` class) holds `_state: MutableAgentState`:
+
+- `systemPrompt` / `model` / `thinkingLevel` / `tools` / `messages`
+- Runtime flags: `isStreaming`, `streamingMessage`, `pendingToolCalls`, `errorMessage`
+
+The `messages` setter shallow-copies. Every LLM call snapshots `state.messages` via `createContextSnapshot()`. The event stream advances state in `Agent.processEvents` based on `message_start/update/end` and `tool_execution_*` events.
+
+#### b) Context — per-turn pipeline before the LLM call
+
+```
+AgentMessage[] → transformContext() → AgentMessage[] → convertToLlm() → Message[] → LLM
+```
+
+- `transformContext` is the hook for context-window management (prune / inject) — invoked in `streamAssistantResponse` in `agent-loop.ts`.
+- `convertToLlm` filters UI-only messages and converts custom message types into the LLM-compatible `user / assistant / toolResult` shape.
+
+#### c) Memory — persisted to disk, reloaded next session
+
+Two distinct mechanisms:
+
+**(i) `AGENTS.md` / `CLAUDE.md` (project-level, auto-loaded into the system prompt).**
+`loadProjectContextFiles` (`coding-agent/src/core/resource-loader.ts`) loads, in order:
+
+1. `~/.pi/agent/AGENTS.md` (global)
+2. Every ancestor of `cwd` (walking up), then `cwd` itself, picking the first of `AGENTS.md` / `CLAUDE.md` per directory.
+
+The resulting files are concatenated into the `# Project Context` section of the system prompt (`coding-agent/src/core/system-prompt.ts`). pi never writes these — they are user-maintained.
+
+**(ii) `MEMORY.md` (runtime self-write, only used by the `mom` Slack agent).**
+The "agent writes its own memory.md" pattern lives in `packages/mom/src/agent.ts`:
+
+- `getMemory()` is called at the start of every run and reads `<workspace>/MEMORY.md` and `<channel>/MEMORY.md`, splicing them into the system prompt.
+- The system prompt explicitly instructs the model to update those files when something is worth remembering.
+- There is **no dedicated `write_memory` tool** — the agent uses the regular `write` / `edit` tools against the two known paths. Update timing is fully model-driven by the prompt.
+
+#### d) Compaction — online context compression
+
+See the dedicated section [Compaction Deep Dive](#compaction-deep-dive) below.
+
+### 2. Tool Use
+
+Tools are defined by `AgentTool<TParameters>` (`packages/agent/src/types.ts`): `name` + `label` + Typebox schema + `execute(id, params, signal, onUpdate)` + optional `prepareArguments`, `executionMode`. Built-in coding tools live in `packages/coding-agent/src/core/tools/`: `read / bash / edit / write / grep / find / ls`. Default exposure is `[read, bash, edit, write]`.
+
+Each tool call goes through four stages in `agent-loop.ts`:
+
+1. **prepare** (`prepareToolCall`): tool lookup → `prepareArguments` → schema validation → `beforeToolCall` hook (may return `{ block: true }`, which materializes an error tool result).
+2. **execute** (`executePreparedToolCall`): runs `tool.execute`; partial results are forwarded as `tool_execution_update` events; thrown errors become an error tool result.
+3. **finalize** (`finalizeExecutedToolCall`): runs `afterToolCall` to optionally override `content / details / isError / terminate`.
+4. **emit**: `tool_execution_end` and a `toolResult` message are appended to the transcript.
+
+Execution mode (`coding-agent/src/core/agent-session.ts`, default `parallel`):
+
+- **parallel**: preflight is sequential (so `beforeToolCall` sees stable state), then allowed tools run concurrently. `tool_execution_end` is emitted in completion order, but `toolResult` messages are flushed in assistant source order so the transcript stays deterministic.
+- **sequential**: one at a time.
+- A single tool may set `executionMode: "sequential"`; if any tool in the batch is sequential, the whole batch degrades to sequential.
+
+`terminate: true` is a hint, not a stop. The loop only stops early when **every** finalized tool result in a batch sets `terminate: true`.
+
+Mid-run injection is exposed via two queues on `Agent`:
+
+- `steer(message)` — injected after the current turn's tool calls finish.
+- `followUp(message)` — injected only when the agent would otherwise stop, restarting the loop.
+
+### 3. Subagent / Agent Teams
+
+The core runtime has **no built-in subagent**. Subagents are implemented as an example extension at `packages/coding-agent/examples/extensions/subagent/`, using **process-level fan-out**: each subagent is a fresh `pi` subprocess with its own context window.
+
+Three modes (`subagent/index.ts`):
+
+- `single` — `{ agent, task }`.
+- `parallel` — `{ tasks: [...] }`. Capped at 8 tasks, 4 concurrent.
+- `chain` — `{ chain: [...] }`. The `{previous}` placeholder in a step's task text is replaced with the prior step's final output.
+
+Each subagent invocation `spawn`s `pi --mode json -p --no-session`, streams `message_end` / `tool_result_end` events back over stdout, and aggregates them. Agent definitions live as Markdown files with frontmatter (`name / description / tools / model`) under `~/.pi/agent/agents/` (user) or `.pi/agents/` (project).
+
+Isolation is real: each subprocess gets its own `--append-system-prompt`, `--tools` allowlist, and `--model`, and never shares the parent transcript. Project-scope agents require explicit opt-in (`agentScope: "project" | "both"`) and prompt for confirmation in interactive mode. Workflow combinations like `/implement` (scout → planner → worker) are just chain presets layered on top of this primitive.
+
+### 4. Failure Handling
+
+Five layers, designed so `Agent` state is always consistent.
+
+**Layer A — Stream contract (`packages/agent/src/types.ts`).** The stream function **must not** throw or reject. All failures are encoded as a final `AssistantMessage` with `stopReason: "error" | "aborted"` and an `errorMessage`. This keeps event flow uniform regardless of provider behavior.
+
+**Layer B — Agent loop (`agent-loop.ts`).** If a streamed message has `stopReason === "error" || "aborted"`, the loop emits `turn_end` + `agent_end` and exits without another LLM call. Tool execution that throws is caught by `executePreparedToolCall` and converted into an error tool result; the loop continues so the model can react. `beforeToolCall` and `afterToolCall` exceptions are handled the same way (`afterToolCall` errors overwrite the result with an error result).
+
+**Layer C — `Agent.runWithLifecycle` (`agent.ts`).** Top-level try/catch. If the stream contract is violated and an exception escapes, `handleRunFailure` synthesizes a fallback assistant message with `stopReason: "error"` and emits `agent_end`. State always converges.
+
+**Layer D — `AgentSession` auto-retry (`coding-agent/src/core/agent-session.ts`, `_handleRetryableError`).**
+
+- `_isRetryableError` matches a long regex covering `overloaded / 429 / 5xx / network errors / connection lost / fetch failed / timeout / terminated / retry delay`.
+- **Context overflow is explicitly excluded** — that path is handled by compaction.
+- Defaults: `maxRetries = 3`, `baseDelayMs = 2000`, exponential backoff (2 s, 4 s, 8 s).
+- The error assistant message is removed from `agent.state.messages` before retry (it is still kept in the persisted session for history).
+- Retry is performed via `agent.continue()`, scheduled with `setTimeout` to escape the event handler.
+- `auto_retry_start` / `auto_retry_end` events drive UI countdown; the wait is abortable via `_retryAbortController`.
+
+**Layer E — Compaction backstop for context overflow (`agent-session.ts`, `_checkCompaction`).**
+
+- Detect via `isContextOverflow` from `pi-ai`. On overflow, drop the failing assistant message, run `_runAutoCompaction("overflow", willRetry = true)`, then auto-`continue`.
+- `_overflowRecoveryAttempted` ensures only one overflow recovery per failure to avoid compact/overflow loops. A second overflow surfaces an actionable error suggesting a larger-context model.
+
+**Subagent layer.** A `chain` halts at the first failing step and reports which step. `parallel` runs are independent. On abort, `SIGTERM` is sent to the subprocess and `SIGKILL` follows after 5 s as a safety net.
+
+The recurring pattern across all five layers: encode failure as data (a message + state field), do not let exceptions escape the loop, and put recovery decisions at the layer that has enough context to make them.
+
+---
+
+## Compaction Deep Dive
+
+Compaction is the mechanism that shrinks the visible context window when a session has accumulated more tokens than the model can carry. It is implemented in `packages/coding-agent/src/core/compaction/compaction.ts` and orchestrated by `AgentSession`.
+
+### Where it sits
+
+```
+agent_end ─→ AgentSession._checkCompaction(lastAssistantMessage)
+              │
+              ├─ overflow path  ─→ _runAutoCompaction("overflow",  willRetry=true)
+              │                     └─→ continue() to retry the failed turn
+              │
+              ├─ threshold path ─→ _runAutoCompaction("threshold", willRetry=false)
+              │                     └─→ user continues manually
+              │
+              └─ manual /compact ─→ _runAutoCompaction("manual",   willRetry=false)
+```
+
+### Trigger conditions
+
+There are three triggers, all funnelled through `_runAutoCompaction(reason, willRetry)`:
+
+| Reason | Trigger | Detection | Auto-retry |
+|---|---|---|---|
+| `overflow` | LLM rejected the request because input exceeded the model's context window | `isContextOverflow(assistantMessage, contextWindow)` returns true on the most recent assistant message; only counted if `assistantMessage.provider === currentModel.provider && assistantMessage.model === currentModel.id` (so an overflow recorded under a smaller model is not re-triggered after switching to a larger one) | Yes — once. `_overflowRecoveryAttempted` blocks a second attempt. |
+| `threshold` | Cumulative context tokens have crossed the configured headroom | `shouldCompact(contextTokens, contextWindow, settings)` where `contextTokens > contextWindow - reserveTokens` | No — the user resumes via the next prompt. |
+| `manual` | User typed `/compact [instructions]` | n/a | No. The optional instructions are forwarded to the summarizer as `customInstructions`. |
+
+Two pre-checks gate every auto run inside `_checkCompaction`:
+
+1. The triggering message is skipped if `stopReason === "aborted"` (the user cancelled).
+2. The triggering message is skipped if it predates the most recent compaction boundary (`assistantMessage.timestamp <= compactionEntry.timestamp`). Without this guard, a stale pre-compaction usage record could re-trigger compaction on the very first prompt after one just finished.
+
+For the `threshold` path on an error message that has no usage data (e.g. persistent 529s), `contextTokens` is estimated from the latest non-aborted assistant message via `estimateContextTokens()`, with a similar staleness guard against pre-compaction usage.
+
+### Token accounting
+
+```ts
+calculateContextTokens(usage) =
+  usage.totalTokens || (input + output + cacheRead + cacheWrite)
+```
+
+When a usage object is unavailable, `estimateTokens(message)` falls back to `chars / 4`, summing text content for `user`, text + thinking + serialized tool calls for `assistant`, content blocks for `toolResult` / `custom`, etc. (see `compaction.ts:232`). Images count as 4800 chars (~1200 tokens) to keep the heuristic conservative.
+
+### Settings (project or `~/.pi/agent/settings.json`)
+
+```json
+{
+  "compaction": {
+    "enabled": true,
+    "reserveTokens": 16384,
+    "keepRecentTokens": 20000
+  }
+}
+```
+
+- `reserveTokens` — headroom kept for the next response. Threshold = `contextWindow - reserveTokens`.
+- `keepRecentTokens` — recent transcript that is **not** summarized. The cut-point walker stops once it has accumulated this many tokens going backwards from the newest entry.
+- `enabled = false` disables auto-compaction entirely; `/compact` still works.
+
+### Pipeline
+
+`prepareCompaction(pathEntries, settings)` produces a `CompactionPreparation`, then `compact(preparation, model, apiKey, …)` runs the actual summarization. The full pipeline:
+
+1. **Skip if last entry is already a compaction.** `prepareCompaction` returns `undefined`, and the orchestrator emits `compaction_end` with `result: undefined`.
+
+2. **Find the previous compaction boundary.** Walking backwards through the branch entries, locate the most recent `compaction` entry. Its `firstKeptEntryId` becomes `boundaryStart` (so messages already summarized once are not re-summarized — but messages **kept** by the previous compaction are re-included, preserving cumulative history). Its `summary` becomes `previousSummary`, used by the iterative-update prompt.
+
+3. **Compute `tokensBefore`** from the rebuilt session context, so the saved `CompactionEntry` records the actual size being replaced.
+
+4. **`findCutPoint(boundaryStart, boundaryEnd, keepRecentTokens)`.**
+
+   - Walk backward from the newest entry, summing `estimateTokens(message)` per entry.
+   - When the running sum reaches `keepRecentTokens`, snap to the **closest valid cut point at or after** that index.
+   - Valid cut points: `user`, `assistant`, `bashExecution`, `custom_message`, `branch_summary`, `compactionSummary`. Never `toolResult` (tool results must stay attached to their tool call).
+   - After picking the cut, scan backwards to absorb adjacent non-message entries (`thinking_level_change`, `model_change`, etc.) so they ride along with the message they belong to. Stop at the previous compaction boundary or any prior message.
+   - If the cut lands on a non-`user` entry, locate the start of that turn (`findTurnStartIndex`) — the result is a **split turn**.
+
+5. **Slice into three regions.**
+
+   - `messagesToSummarize` — entries `[boundaryStart, historyEnd)`. These get summarized and discarded from context.
+   - `turnPrefixMessages` — only populated when `isSplitTurn`: entries `[turnStartIndex, firstKeptEntryIndex)`. The early part of a single oversized turn.
+   - Kept region — entries `[firstKeptEntryIndex, end)`. These remain visible to the model.
+
+6. **Extract file operations.** `extractFileOperations` walks `messagesToSummarize` and merges in any `readFiles / modifiedFiles` from the previous compaction's `details` (skipped for extension-provided compactions to avoid double counting). Result: `fileOps = { read: Set<string>, edited: Set<string> }`.
+
+7. **Extension hook (`session_before_compact`).** If any extension is registered, it receives the full `CompactionPreparation` plus the branch entries and an `AbortSignal`. It can:
+   - Return `{ cancel: true }` — `compaction_end` fires with `aborted: true` and the run stops.
+   - Return `{ compaction: { summary, firstKeptEntryId, tokensBefore, details } }` — the extension's summary replaces pi's. `fromExtension = true` is recorded so file-op details are not later double-merged.
+   - Return nothing — pi runs the default summarization.
+
+8. **Generate summaries (default path, `compact()`).**
+
+   - Serialize `messagesToSummarize` via `convertToLlm` + `serializeConversation` so the model sees a transcript instead of an unfinished conversation. Tool results are truncated to 2000 chars during serialization.
+   - Wrap in `<conversation>…</conversation>` and `<previous-summary>…</previous-summary>` tags.
+   - Pick the prompt template:
+     - First-time → `SUMMARIZATION_PROMPT` (sections: Goal / Constraints & Preferences / Progress (Done / In Progress / Blocked) / Key Decisions / Next Steps / Critical Context).
+     - Has previous summary → `UPDATE_SUMMARIZATION_PROMPT` (preserve old info, move done items from "In Progress" to "Done", update "Next Steps").
+   - `customInstructions` (from `/compact <instructions>`) is appended as "Additional focus".
+   - Call `completeSimple()` with `maxTokens = floor(0.8 * reserveTokens)` and a dedicated `SUMMARIZATION_SYSTEM_PROMPT`. Reasoning level is forwarded if the model supports it.
+   - **Split-turn case**: `generateSummary(messagesToSummarize, …)` and `generateTurnPrefixSummary(turnPrefixMessages, …)` run concurrently via `Promise.all`. The prefix uses `TURN_PREFIX_SUMMARIZATION_PROMPT` and a smaller `maxTokens = floor(0.5 * reserveTokens)`. Outputs are merged: `${history}\n\n---\n\n**Turn Context (split turn):**\n\n${turnPrefix}`.
+   - Append cumulative file operations to the summary as `<read-files>` and `<modified-files>` blocks (`formatFileOperations`).
+
+9. **Persist.** `sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension)` writes a new `CompactionEntry` to the JSONL session file. Then `buildSessionContext()` rebuilds the in-memory transcript: the kept messages plus a synthetic `compactionSummary` message containing the new summary. `agent.state.messages` is replaced with that rebuild.
+
+10. **Emit `session_compact`** so other extensions can react to the saved entry.
+
+11. **Emit `compaction_end`** with `{ reason, result, aborted, willRetry, errorMessage? }`.
+
+12. **Post-compaction continuation.**
+
+    - **`willRetry`** (overflow only): strip a trailing `stopReason: "error"` assistant message if still present, then `setTimeout(() => agent.continue(), 100)` to retry the failed turn under the new, smaller context.
+    - **Has queued messages** (steering or follow-up): kick the loop so they are delivered.
+    - **Otherwise**: leave control to the user.
+
+### What the LLM sees afterward
+
+```
+┌────────┬─────────────────────────────┬─────┬─────┬──────┬─────┐
+│ system │ <compactionSummary message> │ usr │ ass │ tool │ ... │   ← current visible context
+└────────┴─────────────────────────────┴─────┴─────┴──────┴─────┘
+                                       └─── from firstKeptEntryId ───┘
+```
+
+The summary is delivered as a normal message with role `compactionSummary` (converted to an LLM-compatible role by `convertToLlm`), so the model treats it as recap context, not as something to continue.
+
+### Edge cases worth knowing
+
+- **Session needs migration** — if the chosen `firstKeptEntry` has no UUID, `prepareCompaction` returns `undefined` and the run is skipped (older session formats).
+- **Aborted compaction** — `_autoCompactionAbortController` is checked after the (potentially long) summarization call. If the user cancelled mid-summary, no entry is written and `compaction_end` reports `aborted: true`.
+- **Auth missing** — if `modelRegistry.getApiKeyAndHeaders` fails, compaction emits `compaction_end` with `result: undefined` and never calls the LLM.
+- **Cumulative file tracking** — every compaction's `details.readFiles / modifiedFiles` includes prior compactions' lists merged with anything new, so the file footprint of the conversation survives across many compactions.
+- **Branch summarization** is a sibling mechanism (`compaction/branch-summarization.ts`) that fires on `/tree` navigation. It uses the same summary format and the same cumulative file tracking, but writes a `BranchSummaryEntry` instead of a `CompactionEntry`.
