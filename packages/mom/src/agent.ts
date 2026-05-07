@@ -182,7 +182,13 @@ function buildSystemPrompt(
 		? `You are running inside a Docker container (Alpine Linux).
 - Bash working directory: / (use cd or absolute paths)
 - Install tools with: apk add <package>
-- Your changes persist across sessions`
+- Your changes persist across sessions, BUT the container may be recreated on
+  redeploy — when that happens, apk-installed tools and configs in /root
+  (e.g. .gitconfig, .config/gh) are wiped. Bind-mounted dirs (/workspace,
+  /workspace/hrsystem, /root/.ssh) always survive.
+- At the start of any task that needs git or node/npm, self-check first:
+  run \`command -v git nodejs npm >/dev/null 2>&1 || apk add --no-cache git nodejs npm\`
+  before doing the actual work. Do this silently — don't ask the user.`
 		: `You are running directly on the host machine.
 - Bash working directory: ${process.cwd()}
 - Be careful with system modifications`;
